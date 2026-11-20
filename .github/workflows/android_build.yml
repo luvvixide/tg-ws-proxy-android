@@ -1,9 +1,7 @@
 name: Android Build
 
-# Сборка нативного Rust-движка (cargo-ndk) + APK (Gradle).
-# Без секретов кейстора release-сборка подписывается debug-ключом
-# (см. app/build.gradle.kts) — для прод-подписи задайте секреты:
-# ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+# Rust-движок (cargo-ndk) + APK (Gradle) на Linux-раннере.
+# Без секретов кейстора release-APK подписывается debug-ключом (см. app/build.gradle.kts).
 
 on:
   push:
@@ -15,12 +13,11 @@ permissions:
 
 env:
   NDK_VERSION: 27.0.12077973
-  JAVA_VERSION: '17'
 
 jobs:
   build:
     name: Native libs + APK
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -29,7 +26,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: '17'
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v5
@@ -39,71 +36,43 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - name: Setup Android SDK/NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
       - name: Install platform, build-tools and NDK
-        shell: bash
         run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null
+          set -eu
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Install cargo-ndk
-        shell: bash
-        run: cargo install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - name: Build native libs (arm64-v8a, armeabi-v7a)
-        shell: bash
         run: |
-          set -euo pipefail
-          cargo ndk -t arm64-v8a --platform 24 \
-            -o app/src/main/jniLibs build --release
-          cargo ndk -t armeabi-v7a --platform 21 \
-            -o app/src/main/jniLibs build --release
+          set -eu
+          rm -rf app/src/main/jniLibs
+          cargo ndk -t arm64-v8a --platform 24 -o app/src/main/jniLibs build --release
+          cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release
           ls -la app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
 
-      - name: Drop local.properties (CI uses env-based SDK detection)
-        shell: pwsh
-        run: |
-          if (Test-Path local.properties) { Remove-Item local.properties -Force }
-
-      - name: Restore release keystore (optional)
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrEmpty($env:KEYSTORE_B64)) {
-            Write-Output "No keystore secret, release will use debug signing"
-            exit 0
-          }
-          [IO.File]::WriteAllBytes("release.keystore", [Convert]::FromBase64String($env:KEYSTORE_B64))
-          @(
-            "KEYSTORE_FILE=../release.keystore",
-            "KEYSTORE_PASSWORD=$($env:KEYSTORE_PASS)",
-            "KEY_ALIAS=$($env:KEY_ALIAS)",
-            "KEY_PASSWORD=$($env:KEY_PASS)"
-          ) | Out-File -FilePath local.properties -Append -Encoding ascii
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
-
       - name: Build release APKs
-        shell: pwsh
-        run: .\gradlew.bat assembleRelease --no-daemon
+        run: |
+          set -eu
+          rm -f local.properties
+          java -classpath gradle/wrapper/gradle-wrapper.jar \
+            org.gradle.wrapper.GradleWrapperMain assembleRelease --no-daemon
 
       - name: Collect APKs
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $flavors = @('arm32', 'arm64', 'universal')
-          foreach ($f in $flavors) {
-            $src = Get-ChildItem "app\build\outputs\apk\$f\release\*.apk" | Select-Object -First 1
-            if ($null -eq $src) { throw "APK not found for flavor $f" }
-            Copy-Item $src.FullName "dist\tg-ws-proxy-android-$f.apk"
-          }
-          Get-ChildItem dist\*.apk | ForEach-Object { Write-Output "$($_.Name) [$($_.Length) bytes]" }
+          set -eu
+          mkdir -p dist
+          for f in arm32 arm64 universal; do
+            src=$(ls app/build/outputs/apk/$f/release/*.apk | head -n 1)
+            cp "$src" "dist/tg-ws-proxy-android-$f.apk"
+          done
+          ls -la dist
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4

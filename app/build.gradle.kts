@@ -100,6 +100,7 @@ android {
                 signingConfig = signingConfigs.getByName("release")
                 println("✅ Signing config applied: ${resolvedFile.absolutePath}")
             } else {
+                signingConfig = signingConfigs.getByName("debug")
                 println("⚠️ WARNING: Keystore not found, using debug signing")
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }

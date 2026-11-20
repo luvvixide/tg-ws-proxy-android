@@ -81,6 +81,8 @@ pub unsafe extern "C" fn StartProxy(
 
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
+    proxy::reset_tcp_backoff();
+    CF_LAST_SECURE.store(-1, Ordering::Relaxed);
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -175,7 +177,9 @@ pub extern "C" fn StopProxy() -> c_int {
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
-    proxy::set_ws_pool_fronting_first(true);
+    proxy::set_ws_pool_fronting_first(false);
+    proxy::reset_tcp_backoff();
+    CF_LAST_SECURE.store(-1, Ordering::Relaxed);
 
     linfo!("StopProxy: exit");
     0

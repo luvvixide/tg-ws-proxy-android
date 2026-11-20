@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 // Fronting flag — proxy/pool.py::_WsPool.try_fronting_first (начинается true)
 // ---------------------------------------------------------------------------
 
-static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(true);
+static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(false);
 
 pub fn ws_pool_fronting_first() -> bool {
     TRY_FRONTING_FIRST.load(Ordering::Relaxed)
@@ -469,7 +469,7 @@ impl WsPool {
         self.slots.lock().await.clear();
         self.rotating.lock().await.clear();
         self.refill_failures.lock().await.clear();
-        set_ws_pool_fronting_first(true);
+        set_ws_pool_fronting_first(false);
     }
 }
 
@@ -571,26 +571,15 @@ impl CfWorkerPool {
                     e.worker_domain,
                     now - e.created
                 );
-                self.schedule_refill(dc, fallback_dst, worker_domains).await;
+                self.refill_now(dc, fallback_dst, worker_domains).await;
                 Some((e.ws, e.worker_domain))
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
+                self.refill_now(dc, fallback_dst, worker_domains).await;
                 None
             }
         }
-    }
-
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
-        {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                return;
-            }
-            r.insert(dc);
-        }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
     }
 
     pub async fn refill_now(
@@ -647,13 +636,10 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
     ) -> Option<(RawWebSocket, String)> {
-        let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
         for worker_domain in self.available_domains(worker_domains).await {
-            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
-                .await
-            {
+            match ws_connect_cf_full(&worker_domain, &worker_domain, &path, 8.0).await {
                 Ok(ws) => return Some((ws, worker_domain)),
                 Err(exc) => {
                     self.report_failure(&worker_domain, &exc).await;
@@ -1147,6 +1133,43 @@ pub async fn bridge_tcp_stream(
 // TCP fallback — порт bridge._tcp_fallback
 // ---------------------------------------------------------------------------
 
+// Апстрим 50c980e: backoff для TCP-фолбэка (30с .. 3600с), чтобы при заблокированном
+// DC каждое клиентское подключение не висело по 10 с.
+const TCP_BACKOFF_INITIAL: u64 = 30;
+const TCP_BACKOFF_MAX: u64 = 3600;
+
+static TCP_FALLBACK_STATE: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<String, (u32, std::time::Instant)>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub fn reset_tcp_backoff() {
+    TCP_FALLBACK_STATE.lock().clear();
+}
+
+fn tcp_backoff_active(key: &str) -> bool {
+    let st = TCP_FALLBACK_STATE.lock();
+    match st.get(key) {
+        Some((_, after)) => std::time::Instant::now() < *after,
+        None => false,
+    }
+}
+
+fn tcp_backoff_record_failure(key: &str) -> u64 {
+    let mut st = TCP_FALLBACK_STATE.lock();
+    let failures = st.get(key).map(|(f, _)| *f).unwrap_or(0) + 1;
+    let shift = (failures - 1).min(7);
+    let delay = (TCP_BACKOFF_INITIAL * (1u64 << shift)).min(TCP_BACKOFF_MAX);
+    st.insert(
+        key.to_string(),
+        (failures, std::time::Instant::now() + Duration::from_secs(delay)),
+    );
+    delay
+}
+
+fn tcp_backoff_clear(key: &str) {
+    TCP_FALLBACK_STATE.lock().remove(key);
+}
+
 pub async fn tcp_fallback<R, W>(
     conn_read: R,
     conn_write: W,
@@ -1162,18 +1185,31 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let addr = format!("{}:{}", dst, port);
+    if tcp_backoff_active(&addr) {
+        ldebug!("[{}] TCP fallback to {} skipped (backoff)", label, addr);
+        return false;
+    }
     let mut remote =
         match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
+                let delay = tcp_backoff_record_failure(&addr);
+                lwarn!(
+                    "[{}] TCP fallback to {}:{} failed: {}; retry in {}s",
+                    label, dst, port, e, delay
+                );
                 return false;
             }
             Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
+                let delay = tcp_backoff_record_failure(&addr);
+                lwarn!(
+                    "[{}] TCP fallback to {}:{} failed: timeout; retry in {}s",
+                    label, dst, port, delay
+                );
                 return false;
             }
         };
+    tcp_backoff_clear(&addr);
     let _ = remote.set_nodelay(true);
 
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
@@ -1205,7 +1241,7 @@ async fn try_cfproxy_base_domain(
     base_domain: &str,
     ws_path: &str,
 ) -> (Option<RawWebSocket>, String) {
-    let base_domain = normalize_cf_domain(base_domain);
+    let base_domain = canon_cf_domain(base_domain);
     if base_domain.is_empty() {
         return (None, String::new());
     }
@@ -1226,7 +1262,7 @@ async fn try_cfproxy_base_domain(
     let domain = format!("kws{}.{}", dc, base_domain);
     ldebug!(" CF try {}", domain);
 
-    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
+    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 10.0).await;
     if let Some(e) = err {
         // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
         // выжигал бы домены и плодил лавину cooldown.
@@ -1385,7 +1421,6 @@ where
             );
             Some(ws)
         } else {
-            let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
             let query = format!("dst={}&dc={}", fallback_dst, dc);
             let path = format!("/apiws?{}", query);
             let mut found = None;
@@ -1394,16 +1429,7 @@ where
                     "[{}] DC{}{} -> trying CF worker {} for {}",
                     label, dc, m_tag, worker_domain, fallback_dst
                 );
-                match ws_connect_full_opts(
-                    &worker_domain,
-                    &worker_domain,
-                    &path,
-                    10.0,
-                    None,
-                    Some(secure),
-                )
-                .await
-                {
+                match ws_connect_cf_full(&worker_domain, &worker_domain, &path, 10.0).await {
                     Ok(ws) => {
                         found = Some(ws);
                         break;
@@ -1872,7 +1898,8 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await {
+            // Прямой WS к Telegram DC — всегда TLS:443 (как в апстриме); DISABLE_SECURE относится только к CF.
+            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, Some(true)).await {
                 Ok(ws) => {
                     all_redirects = false;
                     ws_opt = Some(ws);
@@ -2093,7 +2120,7 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in domains {
-        match ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await {
+        match ws_connect_full_opts(target, dom, ws_path, timeout, None, Some(true)).await {
             Ok(ws) => return (Some(ws), ws_failed_redirect, false),
             Err(WsError::Handshake(h)) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);

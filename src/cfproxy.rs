@@ -1,5 +1,5 @@
 use crate::config::*;
-use crate::ws::{is_http_status_error, ws_connect_once, RawWebSocket, WsError};
+use crate::ws::{is_http_status_error, ws_connect_cf, RawWebSocket, WsError};
 use crate::{ldebug, lerror, linfo, lwarn};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -53,6 +53,18 @@ pub fn normalize_cf_domain(s: &str) -> String {
     decoded
 }
 
+// Домены в балансере уже декодированы (встроенный список / GitHub / кеш) либо введены
+// пользователем как есть. Повторно гонять их через normalize_cf_domain нельзя: он
+// принимает только *.co.uk и «расшифровывает» любой *.com, из-за чего собственный
+// домен пользователя превращался в мусор/пустую строку и CF для него не работал.
+pub fn canon_cf_domain(s: &str) -> String {
+    let mut d = s.trim().to_lowercase();
+    while d.ends_with('.') {
+        d.pop();
+    }
+    d
+}
+
 pub fn default_cfproxy_domains() -> Vec<String> {
     let mut domains = Vec::with_capacity(CFPROXY_ENC.len());
     for enc in CFPROXY_ENC {
@@ -93,7 +105,7 @@ pub fn clear_cfproxy_429_cooldowns() {
 }
 
 pub fn clear_cfproxy_429_cooldown(domain: &str) {
-    let d = normalize_cf_domain(domain);
+    let d = canon_cf_domain(domain);
     if d.is_empty() {
         return;
     }
@@ -147,7 +159,7 @@ pub fn next_cfproxy_429_cooldown_delay(prev: &Cfproxy429State, retry_after: Dura
 }
 
 pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
-    let d = normalize_cf_domain(domain);
+    let d = canon_cf_domain(domain);
     if d.is_empty() {
         return;
     }
@@ -175,7 +187,7 @@ pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
 }
 
 pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
-    let d = normalize_cf_domain(domain);
+    let d = canon_cf_domain(domain);
     if d.is_empty() {
         return Duration::ZERO;
     }
@@ -589,7 +601,7 @@ pub async fn cf_connect_domain(
     }
 
     let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-    match ws_connect_once(domain, domain, path, host_timeout).await {
+    match ws_connect_cf(domain, domain, path, host_timeout).await {
         Ok(ws) => return (Some(ws), String::new(), None),
         Err(host_err) => {
             if is_http_status_error(&host_err, 429) {
@@ -602,7 +614,7 @@ pub async fn cf_connect_domain(
             }
             ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
             let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-            match ws_connect_once(&resolved_ip, domain, path, ip_timeout).await {
+            match ws_connect_cf(&resolved_ip, domain, path, ip_timeout).await {
                 Ok(ws) => (Some(ws), resolved_ip, None),
                 Err(e) => (None, resolved_ip, Some(e)),
             }

@@ -599,8 +599,9 @@ pub fn ws_connect_timeout(timeout: f64) -> Duration {
 pub fn ws_handshake_timeout(total: Duration) -> Duration {
     if total <= Duration::ZERO {
         Duration::from_secs(3)
-    } else if total > Duration::from_secs(3) {
-        Duration::from_secs(3)
+    } else if total > Duration::from_secs(8) {
+        // Было 3 с: на мобильной сети TLS-рукопожатие с CF часто не укладывалось.
+        Duration::from_secs(8)
     } else {
         total
     }
@@ -834,6 +835,111 @@ pub async fn ws_connect_once_full(
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
     handshake_tls(read_half, write_half, domain, path, timeout).await
+}
+
+// ---------------------------------------------------------------------------
+// CF-подключение с автоподбором схемы (plain :80 / TLS :443).
+//
+// Апстрим (Windows) всегда ходит на CF по TLS:443, а мобильные сети у части
+// пользователей режут 443 и пропускают 80 (поэтому в форке раньше был жёстко :80).
+// Жёсткий выбор ломается в обе стороны, поэтому пробуем предпочтительную схему,
+// затем вторую, и запоминаем ту, что сработала (CF_LAST_SECURE).
+// ---------------------------------------------------------------------------
+
+pub fn cf_preferred_secure() -> bool {
+    match CF_LAST_SECURE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => !DISABLE_SECURE.load(Ordering::Relaxed),
+    }
+}
+
+fn cf_scheme_label(secure: bool) -> &'static str {
+    if secure {
+        "tls:443"
+    } else {
+        "plain:80"
+    }
+}
+
+pub async fn ws_connect_cf(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<RawWebSocket, WsError> {
+    let first = cf_preferred_secure();
+    let e1 = match ws_connect_once_full(dial_addr, domain, path, timeout, None, first).await {
+        Ok(ws) => {
+            CF_LAST_SECURE.store(if first { 1 } else { 0 }, Ordering::Relaxed);
+            return Ok(ws);
+        }
+        Err(e) => e,
+    };
+    // 429 — лимит CF-домена, смена порта не поможет.
+    if is_http_status_error(&e1, 429) {
+        return Err(e1);
+    }
+    ldebug!(
+        " CF {} via {}: {} {} -> пробую {}",
+        domain,
+        dial_addr,
+        cf_scheme_label(first),
+        e1.compact(),
+        cf_scheme_label(!first)
+    );
+    match ws_connect_once_full(dial_addr, domain, path, timeout, None, !first).await {
+        Ok(ws) => {
+            CF_LAST_SECURE.store(if first { 0 } else { 1 }, Ordering::Relaxed);
+            ldebug!(" CF схема переключена на {}", cf_scheme_label(!first));
+            Ok(ws)
+        }
+        Err(e2) => {
+            if is_http_status_error(&e2, 429) {
+                return Err(e2);
+            }
+            Err(WsError::Other(format!(
+                "{} {} / {} {}",
+                cf_scheme_label(first),
+                e1.compact(),
+                cf_scheme_label(!first),
+                e2.compact()
+            )))
+        }
+    }
+}
+
+// Аналог ws_connect_full_opts для CF-воркеров: схема подбирается автоматически,
+// при неудаче по имени хоста — DoH-резолв и повторная попытка по IP.
+pub async fn ws_connect_cf_full(
+    ip: &str,
+    domain: &str,
+    path: &str,
+    timeout: f64,
+) -> Result<RawWebSocket, WsError> {
+    let path = if path.is_empty() { WS_PATH } else { path };
+    let attempt_timeout = ws_connect_timeout(timeout);
+    let primary_addr = if ip.trim().is_empty() {
+        domain.to_string()
+    } else {
+        ip.trim().to_string()
+    };
+    match ws_connect_cf(&primary_addr, domain, path, attempt_timeout).await {
+        Ok(ws) => Ok(ws),
+        Err(e) => {
+            if is_http_status_error(&e, 429) {
+                return Err(e);
+            }
+            if primary_addr == domain && primary_addr.parse::<IpAddr>().is_err() {
+                if let Some(resolved) = crate::cfproxy::resolve_doh(domain).await {
+                    if !resolved.is_empty() && resolved != primary_addr {
+                        return ws_connect_cf(&resolved, domain, path, attempt_timeout).await;
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 // wsConnect: пытается ip, при необходимости резолвит DoH

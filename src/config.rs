@@ -70,7 +70,9 @@ pub const CFPROXY_ACTIVE_FILE_NAME: &str = "cfproxy-active-domain.txt";
 // Оригинал обновляет пул раз в час (3600с) фоновым потоком.
 pub const CFPROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 pub const CFPROXY_MIN_VALID_DOMAINS: usize = 3;
-pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);
+// Апстрим ждёт CF до 10 с на подключение и ещё до 10 с на ответ апгрейда;
+// 4 с на всё было слишком мало для мобильных сетей и «медленного» CF-origin.
+pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const CFPROXY_FALLBACK_PARALLEL: usize = 2;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
 pub const CFPROXY_429_MAX_COOLDOWN: Duration = Duration::from_secs(300);
@@ -82,7 +84,12 @@ pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
+// DISABLE_SECURE теперь означает лишь *предпочтительную* схему для CF (true = сначала
+// plain :80, как нужно мобильным сетям). Если она не отвечает — ws::ws_connect_cf сам пробует
+// другую схему и запоминает рабочую в CF_LAST_SECURE.
 pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+// Последняя успешная схема CF-подключения: -1 — неизвестно, 0 — plain :80, 1 — TLS :443.
+pub static CF_LAST_SECURE: AtomicI32 = AtomicI32::new(-1);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -313,6 +320,7 @@ pub fn is_reserved_start(s: &[u8]) -> bool {
         || s4 == [0xee, 0xee, 0xee, 0xee]
         || s4 == [0xdd, 0xdd, 0xdd, 0xdd]
         || s4 == [0x16, 0x03, 0x01, 0x02]
+        || s4 == b"OPTI" // апстрим c317406: OPTIONS
 }
 
 // ---------------------------------------------------------------------------
